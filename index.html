@@ -89,6 +89,11 @@
             background-color: #173b82;
         }
 
+        #loginButton:disabled {
+            opacity: 0.65;
+            cursor: wait;
+        }
+
         #errorMessage {
             min-height: 20px;
             margin-top: 12px;
@@ -98,7 +103,6 @@
 
         /*
          * 登入後的主畫面：iframe 滿版，底部工具列直接覆蓋 iframe。
-         * 重要：不能讓工具列另外佔用一行，否則會露出
          * Power BI 原生的灰色 Microsoft Power BI / 分享工具列。
          */
         #mainContent {
@@ -126,7 +130,7 @@
         }
 
         /*
-         * 藍色工具列覆蓋 iframe 最下方的 Power BI 品牌／分享列。
+         * 藍色工具列覆蓋 iframe 最下方。
          * 高度約 36px（貼近原始版本），不要蓋住它上方的
          * Power BI 縮放控制列（－、滑桿、＋、百分比、全螢幕）。
          * 如果 Power BI 日後改變工具列尺寸，只需調整 --footer-cover-height。
@@ -252,47 +256,38 @@
     </main>
 
     <script>
-        // 1. 禁止在本網頁開啟滑鼠右鍵選單
+        // 頁面右鍵及常見快捷鍵攔截：僅介面便利設定，不是安全控制。
         document.addEventListener("contextmenu", function(event) {
             event.preventDefault();
         });
 
-        // 2. 嘗試攔截常見的檢視原始碼、開發者工具和儲存網頁快捷鍵
-        // 注意：瀏覽器保留的快捷鍵、瀏覽器選單及跨來源 Power BI iframe
-        // 可能不受此程式控制；本功能無法提供真正的原始碼保護。
         document.addEventListener("keydown", function(event) {
             const key = event.key.toLowerCase();
             const ctrl = event.ctrlKey;
             const shift = event.shiftKey;
             const alt = event.altKey;
-
             const blockF12 = key === "f12" || event.keyCode === 123;
-            const blockViewSourceOrSave = ctrl && !shift && !alt &&
-                (key === "u" || key === "s");         // Ctrl + U、Ctrl + S
-            const blockDevTools = ctrl && shift && !alt &&
-                (key === "i" || key === "j" || key === "c"); // Ctrl + Shift + I/J/C
-
-            if (blockF12 || blockViewSourceOrSave || blockDevTools) {
+            const blockSourceOrSave = ctrl && !shift && !alt && (key === "u" || key === "s");
+            const blockDevTools = ctrl && shift && !alt && (key === "i" || key === "j" || key === "c");
+            if (blockF12 || blockSourceOrSave || blockDevTools) {
                 event.preventDefault();
                 event.stopPropagation();
             }
         }, true);
 
-        // 沿用原本的共用密碼（注意：前端密碼無法提供真正的存取安全）
-        const correctPassword = "Dragon";
+        // 唯一公開的服務網址。真正的 Power Automate HTTP URL 存在 Worker Secret。
+        const authApiUrl = "https://dragon-starlink-auth.myprincessmononoke.workers.dev/";
 
-        // 兩個 Power BI 報表網址
-        const reportUrls = {
-            desktop: "https://reurl.cc/VnZjpQ",
-            mobile: "https://reurl.cc/k9bVpn"
-        };
-
-        const authKey = "voyageAuthenticated";
+        // 同一個瀏覽器登入記憶 90 天；只快取公司與報表網址，絕不保存明文密碼。
+        // 這是前端登入記憶，而非可由後端撤銷/驗證的安全登入憑證。
+        const sessionKey = "dragonStarlinkCenterSessionV1";
         const modeKey = "dragonStarlinkDisplayMode";
+        const sessionDurationMs = 90 * 24 * 60 * 60 * 1000;
         const mobileMedia = window.matchMedia("(max-width: 767px)");
 
         const loginOverlay = document.getElementById("loginOverlay");
         const loginBox = document.getElementById("loginBox");
+        const loginButton = document.getElementById("loginButton");
         const mainContent = document.getElementById("mainContent");
         const passwordInput = document.getElementById("passwordInput");
         const errorMessage = document.getElementById("errorMessage");
@@ -300,109 +295,198 @@
         const mobileButton = document.getElementById("mobileButton");
         const desktopButton = document.getElementById("desktopButton");
 
+        let reportUrls = { mobile: "", desktop: "" };
+        let company = "";
         let currentMode = null;
+        let authenticated = false;
 
-        // 依瀏覽器的可用寬度判斷，適用於手機、平板及電腦
+        function validHttpsUrl(input) {
+            if (typeof input !== "string" || !input.trim()) return "";
+            try {
+                const parsed = new URL(input.trim());
+                return parsed.protocol === "https:" ? parsed.href : "";
+            } catch (_) {
+                return "";
+            }
+        }
+
+        // 容錯：若公司只有一種版型，兩個按鈕都可以正常開啟該報表。
+        function parseReportMapping(data) {
+            if (!data || data.success !== true || typeof data.company !== "string" || !data.company.trim()) {
+                return null;
+            }
+            const mobile = validHttpsUrl(data.mobileUrl);
+            const desktop = validHttpsUrl(data.desktopUrl);
+            if (!mobile && !desktop) return null;
+            return {
+                company: data.company.trim(),
+                mobileUrl: mobile || desktop,
+                desktopUrl: desktop || mobile
+            };
+        }
+
+        function clearStoredSession() {
+            try { localStorage.removeItem(sessionKey); } catch (_) {}
+        }
+
+        function saveSession(mapping) {
+            const data = {
+                ...mapping,
+                expiresAt: Date.now() + sessionDurationMs
+            };
+            try { localStorage.setItem(sessionKey, JSON.stringify(data)); } catch (_) {
+                // 瀏覽器可能封鎖儲存；這種情況下本分頁仍可使用。
+            }
+        }
+
+        function restoreSession() {
+            try {
+                const raw = localStorage.getItem(sessionKey);
+                if (!raw) return null;
+                const saved = JSON.parse(raw);
+                if (typeof saved.expiresAt !== "number" || Date.now() >= saved.expiresAt) {
+                    clearStoredSession();
+                    return null;
+                }
+                const mapping = parseReportMapping({ ...saved, success: true });
+                if (!mapping) clearStoredSession();
+                return mapping;
+            } catch (_) {
+                clearStoredSession();
+                return null;
+            }
+        }
+
         function detectDisplayMode() {
             return mobileMedia.matches ? "mobile" : "desktop";
         }
 
-        // 手動切換時記住選擇，同一個分頁重新整理仍維持該模式
         function setDisplayMode(mode, manual = false) {
-            if (!Object.prototype.hasOwnProperty.call(reportUrls, mode)) {
-                return;
-            }
-
+            if (!authenticated || !Object.prototype.hasOwnProperty.call(reportUrls, mode)) return;
             if (manual) {
-                sessionStorage.setItem(modeKey, mode);
+                try { sessionStorage.setItem(modeKey, mode); } catch (_) {}
             }
-
             currentMode = mode;
             mobileButton.setAttribute("aria-pressed", String(mode === "mobile"));
             desktopButton.setAttribute("aria-pressed", String(mode === "desktop"));
-
-            // 只有切換報表時才變更網址，避免重複載入
             if (iframe.getAttribute("src") !== reportUrls[mode]) {
                 iframe.src = reportUrls[mode];
             }
         }
 
-        function showMainContent() {
+        function showMainContent(mapping) {
+            company = mapping.company;
+            reportUrls = { mobile: mapping.mobileUrl, desktop: mapping.desktopUrl };
+            authenticated = true;
+            iframe.title = company + " Starlink Power BI Report";
             loginOverlay.style.display = "none";
             mainContent.style.display = "block";
 
-            const savedMode = sessionStorage.getItem(modeKey);
+            let savedMode = null;
+            try { savedMode = sessionStorage.getItem(modeKey); } catch (_) {}
             const mode = savedMode === "mobile" || savedMode === "desktop"
-                ? savedMode
-                : detectDisplayMode();
-
+                ? savedMode : detectDisplayMode();
             setDisplayMode(mode);
         }
 
-        // 統一登入
-        loginBox.addEventListener("submit", function(event) {
+        // 密碼僅在首次登入時送往 Cloudflare Worker -> Power Automate -> OneDrive Excel。
+        loginBox.addEventListener("submit", async function(event) {
             event.preventDefault();
-
-            if (passwordInput.value === correctPassword) {
-                sessionStorage.setItem(authKey, "true");
-                errorMessage.textContent = "";
-                passwordInput.value = "";
-                showMainContent();
-            } else {
-                errorMessage.textContent = "Incorrect password. Please try again.";
-                passwordInput.value = "";
+            if (loginButton.disabled) return;
+            const password = passwordInput.value;
+            if (!password) {
+                errorMessage.textContent = "Please enter the password.";
                 passwordInput.focus();
+                return;
+            }
+
+            loginButton.disabled = true;
+            loginButton.textContent = "Signing in...";
+            errorMessage.textContent = "";
+            const controller = new AbortController();
+            const timeout = setTimeout(() => controller.abort(), 25000);
+            try {
+                const response = await fetch(authApiUrl, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ password }),
+                    signal: controller.signal,
+                    cache: "no-store"
+                });
+
+                if (response.status === 401) {
+                    errorMessage.textContent = "Incorrect password. Please try again.";
+                    passwordInput.value = "";
+                    passwordInput.focus();
+                    return;
+                }
+                if (!response.ok) {
+                    throw new Error("Authentication service unavailable (HTTP " + response.status + ").");
+                }
+                const result = await response.json();
+                const mapping = parseReportMapping(result);
+                if (!mapping) {
+                    throw new Error("Invalid company or report URL returned by the service.");
+                }
+                saveSession(mapping);
+                passwordInput.value = "";
+                showMainContent(mapping);
+            } catch (error) {
+                errorMessage.textContent = error.name === "AbortError"
+                    ? "Connection timed out. Please try again."
+                    : "Sign-in failed. Please try again later.";
+            } finally {
+                clearTimeout(timeout);
+                loginButton.disabled = false;
+                loginButton.textContent = "Login";
             }
         });
 
-        // 左下角手動切換 Mobile / Desktop，不必重新登入
         mobileButton.addEventListener("click", function() {
             setDisplayMode("mobile", true);
         });
-
         desktopButton.addEventListener("click", function() {
             setDisplayMode("desktop", true);
         });
 
-        // Refresh：重新載入目前選擇的報表，不重新登入
         document.getElementById("refreshButton").addEventListener("click", function() {
-            if (currentMode) {
+            if (authenticated && currentMode) {
                 iframe.src = reportUrls[currentMode];
             }
         });
 
-        // Logout：清除登入狀態及手動選擇，下次登入重新自動判斷
+        // 登出清除 90 天記憶與本分頁顯示模式。
         document.getElementById("logoutButton").addEventListener("click", function() {
-            sessionStorage.removeItem(authKey);
-            sessionStorage.removeItem(modeKey);
-
+            clearStoredSession();
+            try { sessionStorage.removeItem(modeKey); } catch (_) {}
             mainContent.style.display = "none";
             iframe.src = "about:blank";
+            authenticated = false;
             currentMode = null;
+            company = "";
+            reportUrls = { mobile: "", desktop: "" };
             loginOverlay.style.display = "flex";
             passwordInput.value = "";
             errorMessage.textContent = "";
             passwordInput.focus();
         });
 
-        // 未手動指定時，旋轉手機或調整視窗大小會自動切換
+        // 當使用者未手動選擇版型時，手機旋轉或視窗尺寸變更會自動切換。
         function handleScreenChange() {
-            if (sessionStorage.getItem(authKey) === "true" &&
-                !sessionStorage.getItem(modeKey)) {
-                setDisplayMode(detectDisplayMode());
-            }
+            let savedMode = null;
+            try { savedMode = sessionStorage.getItem(modeKey); } catch (_) {}
+            if (authenticated && !savedMode) setDisplayMode(detectDisplayMode());
         }
-
         if (typeof mobileMedia.addEventListener === "function") {
             mobileMedia.addEventListener("change", handleScreenChange);
         } else {
-            // 相容較舊的 Safari
             mobileMedia.addListener(handleScreenChange);
         }
 
-        // 同一個分頁已登入就直接顯示；否則要求輸入密碼
-        if (sessionStorage.getItem(authKey) === "true") {
-            showMainContent();
+        // 重新開啟同一瀏覽器時，如 90 天內有快取資料，便可直接顯示上次的報表。
+        const savedMapping = restoreSession();
+        if (savedMapping) {
+            showMainContent(savedMapping);
         } else {
             passwordInput.focus();
         }
